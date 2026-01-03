@@ -1,29 +1,46 @@
 import streamlit as st
-import face_recognition
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw
+import mediapipe as mp
 
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="Face Recognition App", layout="centered")
-st.title("👤 Nhận diện khuôn mặt + Đặt tên")
+st.set_page_config(page_title="Face Recognition - MediaPipe", layout="centered")
+st.title("👤 Nhận diện khuôn mặt + Đặt tên (MediaPipe)")
 
 # =========================
 # SESSION STORAGE
 # =========================
-if "known_faces" not in st.session_state:
-    st.session_state.known_faces = []  # list of dicts
+if "faces" not in st.session_state:
+    st.session_state.faces = []  # {name, feature}
 
 # =========================
-# FUNCTIONS
+# MEDIAPIPE INIT
 # =========================
-def encode_face(image_np):
-    locations = face_recognition.face_locations(image_np)
-    if len(locations) != 1:
-        return None, None
-    encoding = face_recognition.face_encodings(image_np, locations)[0]
-    return encoding, locations[0]
+@st.cache_resource
+def load_detector():
+    return mp.solutions.face_detection.FaceDetection(
+        model_selection=0,
+        min_detection_confidence=0.6
+    )
+
+detector = load_detector()
+
+# =========================
+# FEATURE EXTRACTION
+# =========================
+def extract_feature(face_img):
+    face_img = cv2.resize(face_img, (100, 100))
+    hist = cv2.calcHist([face_img], [0, 1, 2], None, [8, 8, 8],
+                        [0, 256, 0, 256, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.flatten()
+
+def compare_features(f1, f2):
+    return cv2.compareHist(f1.astype("float32"), f2.astype("float32"),
+                            cv2.HISTCMP_CORREL)
 
 # =========================
 # TABS
@@ -34,63 +51,80 @@ tab1, tab2 = st.tabs(["➕ Đăng ký khuôn mặt", "🔍 Nhận diện"])
 # TAB 1 – REGISTER
 # =========================
 with tab1:
-    st.subheader("➕ Đăng ký khuôn mặt mới")
+    st.subheader("➕ Đăng ký khuôn mặt")
 
-    name = st.text_input("Tên người dùng")
+    name = st.text_input("Tên")
     img = st.camera_input("Chụp ảnh khuôn mặt")
 
-    if st.button("💾 Lưu khuôn mặt"):
+    if st.button("💾 Lưu"):
         if not name or img is None:
-            st.warning("⚠️ Vui lòng nhập tên và chụp ảnh")
+            st.warning("⚠️ Nhập tên và chụp ảnh")
             st.stop()
 
         image = Image.open(img).convert("RGB")
         img_np = np.array(image)
+        h, w, _ = img_np.shape
 
-        encoding, location = encode_face(img_np)
+        results = detector.process(img_np)
 
-        if encoding is None:
+        if not results.detections or len(results.detections) != 1:
             st.error("❌ Ảnh phải có đúng 1 khuôn mặt")
-        else:
-            st.session_state.known_faces.append({
-                "name": name,
-                "encoding": encoding
-            })
-            st.success(f"✅ Đã lưu khuôn mặt của {name}")
+            st.stop()
+
+        bbox = results.detections[0].location_data.relative_bounding_box
+        x1 = int(bbox.xmin * w)
+        y1 = int(bbox.ymin * h)
+        x2 = int((bbox.xmin + bbox.width) * w)
+        y2 = int((bbox.ymin + bbox.height) * h)
+
+        face = img_np[y1:y2, x1:x2]
+
+        feature = extract_feature(face)
+        st.session_state.faces.append({"name": name, "feature": feature})
+
+        st.success(f"✅ Đã lưu khuôn mặt của {name}")
 
 # =========================
-# TAB 2 – RECOGNITION
+# TAB 2 – RECOGNIZE
 # =========================
 with tab2:
     st.subheader("🔍 Nhận diện khuôn mặt")
 
-    if len(st.session_state.known_faces) == 0:
-        st.info("ℹ️ Chưa có khuôn mặt nào được đăng ký")
+    if len(st.session_state.faces) == 0:
+        st.info("ℹ️ Chưa có dữ liệu khuôn mặt")
         st.stop()
 
-    img = st.camera_input("Chụp ảnh để nhận diện", key="recognize")
+    img = st.camera_input("Chụp ảnh để nhận diện", key="rec")
 
     if img:
         image = Image.open(img).convert("RGB")
         img_np = np.array(image)
+        h, w, _ = img_np.shape
 
-        with st.spinner("🧠 Đang nhận diện..."):
-            face_locations = face_recognition.face_locations(img_np)
-            face_encodings = face_recognition.face_encodings(img_np, face_locations)
-
+        results = detector.process(img_np)
         draw = ImageDraw.Draw(image)
 
-        known_encodings = [f["encoding"] for f in st.session_state.known_faces]
-        known_names = [f["name"] for f in st.session_state.known_faces]
+        if results.detections:
+            for det in results.detections:
+                bbox = det.location_data.relative_bounding_box
+                x1 = int(bbox.xmin * w)
+                y1 = int(bbox.ymin * h)
+                x2 = int((bbox.xmin + bbox.width) * w)
+                y2 = int((bbox.ymin + bbox.height) * h)
 
-        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=0.45)
-            name = "Unknown"
+                face = img_np[y1:y2, x1:x2]
+                feat = extract_feature(face)
 
-            if True in matches:
-                name = known_names[matches.index(True)]
+                name = "Unknown"
+                best_score = 0.6
 
-            draw.rectangle(((left, top), (right, bottom)), outline="red", width=3)
-            draw.text((left, top - 10), name, fill="red")
+                for f in st.session_state.faces:
+                    score = compare_features(feat, f["feature"])
+                    if score > best_score:
+                        best_score = score
+                        name = f["name"]
 
-        st.image(image, caption="Kết quả nhận diện", use_container_width=True)
+                draw.rectangle(((x1, y1), (x2, y2)), outline="red", width=3)
+                draw.text((x1, y1 - 10), name, fill="red")
+
+        st.image(image, use_container_width=True)
